@@ -1,0 +1,19 @@
+# Python 3.10+
+#
+# The mapper (python3 -m mapping_algorithms.build_map) uses only the
+# standard library: ast, json, argparse, pathlib, dataclasses.
+# There are no third-party Python packages to install.
+#
+#   pip install -r requirements.txt
+#
+# Tools this file cannot install (install them with your OS package manager):
+#   g++ or clang++   C++17 compiler
+#   make
+#   curl             the app calls the local model over HTTP
+#
+# Already in the repo:
+#   third_party/json.hpp    nlohmann JSON, used to read utils/map.json
+#
+# Not a Python dependency:
+#   Qwen via llama.cpp or Ollama. Start that server yourself, then set
+#   LLM_BASE_URL and LLM_MODEL. See README.md.
