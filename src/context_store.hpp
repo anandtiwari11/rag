@@ -17,7 +17,7 @@ public:
         std::string text;
     };
 
-    explicit ContextStore(std::string path, int max_tokens = 20000)
+    explicit ContextStore(std::string path, int max_tokens = 1000000)
         : path_(std::move(path)), max_tokens_(max_tokens) {}
 
     void append(const std::string& role, const std::string& text) {

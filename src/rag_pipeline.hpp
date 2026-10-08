@@ -10,6 +10,7 @@
 #include "excluded.hpp"
 #include "llm_client.hpp"
 #include "map_loader.hpp"
+#include "method_notes.hpp"
 #include "rank_methods.hpp"
 #include "source_reader.hpp"
 
@@ -24,15 +25,20 @@ struct RagConfig {
     size_t max_batch_chars = 10000;   // ~2.5k tokens of source total
     size_t history_chars = 2500;      // keep last Q&A for follow-ups like "elaborate"
     int show_matches = 8;
+    // Natural-language questions open this many related methods, best first.
+    // Env: RAG_TOPIC_LIMIT (clamped to 1..12)
+    int topic_limit = 4;
     bool debug = true;
     bool dry_run = false;
     // When context.txt grows past this many tokens (~4 chars each), it is
     // summarised and the file is rewritten. Env: RAG_CONTEXT_MAX_TOKENS
-    int context_max_tokens = 20000;
+    int context_max_tokens = 1000000;
     // How many times to call the LLM for one answer.
     // Each later pass revises the previous reply so it matches the user's question.
     // Env: RAG_REFINE_PASSES (clamped to 1..5)
     int refine_passes = 3;
+    // Saved answers for methods already explained. Empty disables the cache.
+    std::string notes_dir;
 };
 
 // Optimised for a small local model (Qwen 3B on CPU):
@@ -225,10 +231,40 @@ private:
     // callers, a single line, and so on). Later passes only make the reply
     // match that question more closely. They do not switch the topic.
     // Pass 1 returning NOT_FOUND stops the loop so retrieval can try the next batch.
+    MethodNotes notes() const { return MethodNotes(cfg_.notes_dir, map_); }
+
+    // Attach any saved notes for these methods. Returns how many were found.
+    int append_saved_notes(std::ostream& out, const std::vector<const MethodInfo*>& methods) const {
+        if (cfg_.notes_dir.empty()) return 0;
+        int found = 0;
+        MethodNotes store = notes();
+        for (const MethodInfo* method : methods) {
+            if (!method) continue;
+            std::string saved = store.load(*method);
+            if (saved.empty()) continue;
+            if (saved.size() > 4000) saved.resize(4000);
+            ++found;
+            debug("using saved note " + store.path_for(*method));
+            out << "Pre-context from utils/cache for " << method->name << ":\n";
+            out << saved << "\n\n";
+        }
+        return found;
+    }
+
+    void remember_answer(const MethodInfo* method, const std::string& answer) const {
+        if (!method || cfg_.dry_run || cfg_.notes_dir.empty()) return;
+        if (answer.empty() || looks_like_not_found(answer)) return;
+        if (answer.rfind("[dry-run]", 0) == 0) return;
+        notes().save(*method, answer);
+        debug("saved note " + notes().path_for(*method));
+    }
+
     std::string refine_answer(const std::string& question,
                               const std::string& source_block,
-                              bool allow_not_found) const {
-        const int passes = std::max(1, std::min(cfg_.refine_passes, 5));
+                              bool allow_not_found,
+                              int pass_limit = -1) const {
+        int passes = std::max(1, std::min(cfg_.refine_passes, 5));
+        if (pass_limit > 0) passes = std::min(passes, pass_limit);
         if (cfg_.dry_run) {
             debug("refine loop skipped (dry-run); configured passes=" + std::to_string(passes));
             return call_llm("dry-run", question + "\n\n" + source_block);
@@ -236,8 +272,10 @@ private:
 
         const std::string base =
             "You answer questions about code.\n"
-            "Use ONLY the source provided. Do not invent.\n"
+            "Use ONLY the source and any pre-context provided. Do not invent.\n"
+            "The methods were retrieved because they relate to the question.\n"
             "Answer the user's question directly. Match the kind of answer they asked for.\n"
+            "Do not say NOT_FOUND because the question is not the exact function name.\n"
             "If the source was truncated, say the omitted part was not shown.\n";
 
         std::string notes;
@@ -298,6 +336,11 @@ private:
         debug("methods above score " + std::to_string(static_cast<int>(cfg_.min_score)) + ": " +
               std::to_string(ranked.size()));
 
+        // "how is invoice created" is not a method name. Open the related methods.
+        if (!names_one_method(query, ranked)) {
+            return answer_topic(query, keywords);
+        }
+
         std::ostringstream retrieval;
         for (size_t i = 0; i < ranked.size() && static_cast<int>(i) < cfg_.show_matches; ++i) {
             const auto& r = ranked[i];
@@ -352,8 +395,10 @@ private:
             }
             debug("batch " + std::to_string(batch) + " -> sending " + std::to_string(picked.size()) +
                   " method(s): " + names.str());
+            append_saved_notes(user, used);
             context_.append("METHOD_CONTEXT", "batch " + std::to_string(batch) + "\n" + user.str());
 
+            // Cache is pre-context for this call. The model still runs.
             answer = refine_answer(query, user.str(), /*allow_not_found=*/!strong);
 
             if (strong || cfg_.dry_run || !looks_like_not_found(answer)) break;
@@ -366,7 +411,92 @@ private:
 
         last_methods_ = used;
         remember_methods(used);
+        for (const MethodInfo* method : used) remember_answer(method, answer);
         return answer;
+    }
+
+    // True when the user typed a method name (or a close typo), not a question
+    // like "how is invoice created".
+    bool names_one_method(const std::string& query, const std::vector<RankedMethod>& ranked) const {
+        if (ranked.empty()) return false;
+        if (!rank_detail::identifiers_in(query).empty() && ranked.front().score >= cfg_.strong_score) return true;
+        if (ranked.front().reason == "exact") return true;
+        if (ranked.front().reason == "fuzzy" && ranked.front().score >= cfg_.strong_score) return true;
+        return false;
+    }
+
+    // Open the most relevant methods for a question, best first.
+    // Each one is sent to the model with its cache file as pre-context, then saved again.
+    std::string answer_topic(const std::string& query, const std::vector<std::string>& keywords) {
+        const auto ranked = rank_topic_methods(map_, keywords);
+        debug("topic methods: " + std::to_string(ranked.size()));
+        if (ranked.empty()) {
+            return "I could not find any method in the code map matching that question. "
+                   "Try using words that appear in the method name, or the method name itself.";
+        }
+
+        const int limit = std::max(1, std::min(cfg_.topic_limit, static_cast<int>(ranked.size())));
+        debug("opening the " + std::to_string(limit) + " most relevant, best first");
+
+        std::ostringstream retrieval;
+        for (int i = 0; i < limit && i < cfg_.show_matches; ++i) {
+            std::ostringstream line;
+            line << (i + 1) << ". " << static_cast<int>(ranked[i].score) << " [topic] "
+                 << describe(*ranked[i].method);
+            debug(line.str());
+            retrieval << line.str() << "\n";
+        }
+        if (static_cast<int>(ranked.size()) > limit) {
+            debug(std::to_string(ranked.size() - limit) +
+                  " more related methods not opened this time (RAG_TOPIC_LIMIT)");
+        }
+        context_.append("RETRIEVAL", retrieval.str());
+
+        std::vector<const MethodInfo*> explored;
+        std::ostringstream notes;
+        size_t cursor = 0;
+        int opened = 0;
+        int batch = 0;
+        while (opened < limit && cursor < ranked.size()) {
+            const int room = limit - opened;
+            const auto picked = next_batch(ranked, cursor, std::min(cfg_.batch_size, room));
+            if (picked.empty()) break;
+            ++batch;
+
+            std::ostringstream user;
+            user << "Question:\n" << query << "\n\n";
+            user << "These methods were opened because they relate to the question, "
+                 << "most relevant first. Explain what they do for this question.\n\n";
+            std::vector<const MethodInfo*> used;
+            std::ostringstream names;
+            for (size_t k = 0; k < picked.size(); ++k) {
+                const auto& r = ranked[picked[k]];
+                user << method_block(*r.method, static_cast<int>(opened + k + 1), r.score) << "\n";
+                used.push_back(r.method);
+                names << r.method->name << (k + 1 < picked.size() ? ", " : "");
+            }
+            debug("topic batch " + std::to_string(batch) + " -> " + names.str());
+            append_saved_notes(user, used);
+            context_.append("METHOD_CONTEXT", "topic batch " + std::to_string(batch) + "\n" + user.str());
+
+            // One pass per batch so several methods can be opened. Cache is only pre-context.
+            const std::string note = refine_answer(query, user.str(), /*allow_not_found=*/false,
+                                                    /*pass_limit=*/1);
+            for (const MethodInfo* method : used) {
+                remember_answer(method, note);
+                explored.push_back(method);
+            }
+            notes << note << "\n\n";
+            opened += static_cast<int>(picked.size());
+        }
+
+        remember_methods(explored);
+        if (batch <= 1) return notes.str();
+
+        std::ostringstream combined;
+        combined << "Notes from the related methods, most relevant first:\n\n" << notes.str();
+        debug("combining " + std::to_string(explored.size()) + " method notes into one answer");
+        return refine_answer(query, combined.str(), /*allow_not_found=*/false, /*pass_limit=*/1);
     }
 
     // Follow-up like "elaborate better" — keep the same method + prior chat.
@@ -397,6 +527,7 @@ private:
         user << "Method source (same as before):\n\n";
 
         int idx = 1;
+        const MethodInfo* explained = nullptr;
         std::ostringstream names;
         for (const auto* m : last_methods_) {
             if (!m) continue;
@@ -404,12 +535,16 @@ private:
             if (idx > 1) break;
             user << method_block(*m, idx, 0.0) << "\n";
             names << m->name;
+            explained = m;
             ++idx;
         }
+        if (explained) append_saved_notes(user, {explained});
         debug("follow-up -> sending " + names.str());
         context_.append("METHOD_CONTEXT", "follow-up\n" + user.str());
 
-        return refine_answer(query, user.str(), /*allow_not_found=*/false);
+        const std::string answer = refine_answer(query, user.str(), /*allow_not_found=*/false);
+        remember_answer(explained, answer);
+        return answer;
     }
 
     const MethodInfo* pick_usage_target(const std::string& query) const {
@@ -472,6 +607,7 @@ private:
         if (!history.empty()) user << history << "\n";
         user << "Question:\n" << query << "\n\n";
         user << "Target method: " << target->name << " (" << target->location() << ")\n\n";
+        append_saved_notes(user, {target});
         user << "Parent methods that call the target:\n\n";
         std::vector<const MethodInfo*> used = {target};
         for (size_t k = 0; k < picked.size(); ++k) {

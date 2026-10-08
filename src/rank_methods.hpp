@@ -206,3 +206,84 @@ inline std::vector<RankedMethod> rank_methods(const MethodMap& map,
     });
     return ranked;
 }
+
+// Natural-language questions ("how is invoice created") are not a method name.
+// Keep methods that share the most specific word (invoice, not every create_*),
+// then sort so names that also match the other words come first.
+inline std::vector<RankedMethod> rank_topic_methods(const MethodMap& map,
+                                                    const std::vector<std::string>& keywords) {
+    std::vector<std::string> content;
+    for (const auto& kw : keywords) {
+        if (kw.size() >= 4) content.push_back(kw);
+    }
+    if (content.empty()) content = keywords;
+    if (content.empty()) return {};
+
+    auto best_hit = [](const std::string& name, const std::string& kw) {
+        double best = 0.0;
+        for (const auto& tok : rank_detail::split_snake(name)) {
+            best = std::max(best, rank_detail::keyword_vs_token(kw, tok));
+        }
+        if (kw.size() >= 4 && name.find(kw) != std::string::npos) best = std::max(best, 80.0);
+        return best;
+    };
+
+    std::vector<std::string> names;
+    names.reserve(map.methods.size());
+    for (const auto& m : map.methods) names.push_back(FuzzyNameSearch::normalize_name(m.name));
+
+    std::vector<int> hit_count(content.size(), 0);
+    std::vector<std::vector<double>> hits(map.methods.size(), std::vector<double>(content.size(), 0.0));
+    for (size_t i = 0; i < map.methods.size(); ++i) {
+        if (names[i].empty()) continue;
+        for (size_t k = 0; k < content.size(); ++k) {
+            const double s = best_hit(names[i], content[k]);
+            if (s >= 70.0) {
+                hits[i][k] = s;
+                ++hit_count[k];
+            }
+        }
+    }
+
+    size_t anchor = 0;
+    int anchor_hits = 0;
+    for (size_t k = 0; k < content.size(); ++k) {
+        if (hit_count[k] == 0) continue;
+        if (anchor_hits == 0 || hit_count[k] < anchor_hits) {
+            anchor = k;
+            anchor_hits = hit_count[k];
+        }
+    }
+    if (anchor_hits == 0) return {};
+
+    std::vector<RankedMethod> ranked;
+    for (size_t i = 0; i < map.methods.size(); ++i) {
+        if (hits[i][anchor] < 70.0) continue;
+        int matched = 0;
+        double sum = 0.0;
+        for (size_t k = 0; k < content.size(); ++k) {
+            if (hits[i][k] >= 70.0) {
+                ++matched;
+                sum += hits[i][k];
+            }
+        }
+        double coverage = 0.0;
+        const double tok = rank_detail::token_score(keywords, names[i], &coverage);
+        RankedMethod r;
+        r.method = &map.methods[i];
+        r.fuzzy = 0.0;
+        r.coverage = static_cast<double>(matched) / static_cast<double>(content.size());
+        r.score = (sum / matched) * 0.5 + matched * 20.0 + tok * 0.25;
+        r.reason = "topic";
+        if (is_test_code(map.methods[i])) r.score *= 0.92;
+        ranked.push_back(r);
+    }
+
+    std::sort(ranked.begin(), ranked.end(), [](const RankedMethod& a, const RankedMethod& b) {
+        if (a.score != b.score) return a.score > b.score;
+        if (a.coverage != b.coverage) return a.coverage > b.coverage;
+        if (a.method->name.size() != b.method->name.size()) return a.method->name.size() < b.method->name.size();
+        return a.method->name < b.method->name;
+    });
+    return ranked;
+}

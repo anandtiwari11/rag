@@ -24,8 +24,9 @@ int env_int(const char* name, int fallback, int lo, int hi) {
 }
 
 void apply_env(RagConfig& cfg) {
-    cfg.context_max_tokens = env_int("RAG_CONTEXT_MAX_TOKENS", cfg.context_max_tokens, 1000, 200000);
+    cfg.context_max_tokens = env_int("RAG_CONTEXT_MAX_TOKENS", cfg.context_max_tokens, 1000, 5000000);
     cfg.refine_passes = env_int("RAG_REFINE_PASSES", cfg.refine_passes, 1, 5);
+    cfg.topic_limit = env_int("RAG_TOPIC_LIMIT", cfg.topic_limit, 1, 12);
 }
 
 void print_help() {
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
         const std::string root = project_root();
         RagConfig cfg;
         apply_env(cfg);
+        cfg.notes_dir = root + "/utils/cache";
         std::string query;
 
         for (int i = 1; i < argc; ++i) {
@@ -65,6 +67,8 @@ int main(int argc, char** argv) {
         std::cout << "context resets after ~" << cfg.context_max_tokens
                   << " tokens (RAG_CONTEXT_MAX_TOKENS)\n";
         std::cout << "llm refine passes: " << cfg.refine_passes << " (RAG_REFINE_PASSES)\n";
+        std::cout << "topic questions open the top " << cfg.topic_limit
+                  << " related methods (RAG_TOPIC_LIMIT)\n";
         if (!llm.configured() && !cfg.dry_run) {
             std::cout << "LLM_MODEL is not set. Set it (e.g. export LLM_MODEL=qwen2.5:3b) "
                          "or use --dry-run to inspect retrieval only.\n";

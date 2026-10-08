@@ -8,3 +8,4 @@ venv/
 # Generated from a local repo. Rebuild with the mapper; do not commit it.
 utils/map.json
 utils/context.txt
+utils/cache/

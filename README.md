@@ -44,6 +44,7 @@ A follow-up such as "can you elaborate" keeps the last method. It does not searc
 | `src/rag_pipeline.hpp` | Retrieval, follow-ups, and the answer loop |
 | `src/llm_client.hpp` | OpenAI-compatible call to a local server (llama.cpp, Ollama, ...) |
 | `utils/context.txt` | Conversation log. Summarised after a token limit. |
+| `utils/cache/` | One saved answer per method, reused the next time that method is needed. |
 | `utils/excluded.txt` | Words ignored when splitting a question |
 
 ## Set up on your own machine
@@ -186,7 +187,7 @@ If a later request fails with "model not found", set `LLM_MODEL` to the `id` fro
 From the project folder, with the exports from step 5 still set:
 
 ```bash
-export RAG_CONTEXT_MAX_TOKENS=20000
+export RAG_CONTEXT_MAX_TOKENS=1000000
 export RAG_REFINE_PASSES=3
 export LLM_MAX_TOKENS=1000
 
@@ -229,7 +230,7 @@ If you see `Failed to connect`, the server from step 5 is not running, or `LLM_B
 | `LLM_MAX_TOKENS` | `1000` | Max tokens in one model reply |
 | `LLM_TEMPERATURE` | `0.1` | Sampling temperature |
 | `LLM_TIMEOUT_SECONDS` | `180` | HTTP timeout |
-| `RAG_CONTEXT_MAX_TOKENS` | `20000` | Summarise `context.txt` after this many tokens |
+| `RAG_CONTEXT_MAX_TOKENS` | `1000000` | Summarise `context.txt` after this many tokens |
 | `RAG_REFINE_PASSES` | `3` | Model calls per answer (1 to 5) |
 | `RAG_ROOT` | this project directory | Where `utils/` lives |
 
